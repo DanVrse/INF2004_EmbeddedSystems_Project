@@ -3,6 +3,10 @@
  * Barcode reader on MH-sensor #3 beside the track (Buddy 3).
  * Reads Code 39 barcodes: thick/thin black bars and thick/thin white gaps,
  * framed by '*' start and stop characters (e.g. "*L*").
+ *
+ * The sensor's ANALOG output (AO) is sampled by the ADC at 2 kHz. Software
+ * thresholds with hysteresis turn the voltage into black/white edges, which
+ * are timed exactly as before.
  */
 
 #ifndef BARCODE_H
@@ -12,10 +16,16 @@
 #include <stdint.h>
 
 // Pin from the Design Review pin table (Section 2).
-#define BARCODE_PIN            7      // MH-sensor #3 DO (Grove 7)
+#define BARCODE_AO_PIN         27     // MH-sensor #3 AO (Grove 6), ADC1
+#define BARCODE_ADC_INPUT      1      // GP27 = ADC input 1
 
-// 1 = DO reads HIGH over a black bar (same as the line sensors).
+// 1 = AO voltage is HIGHER over a black bar (usual for MH-sensors).
+// Set to 0 if the serial output shows the opposite.
 #define BARCODE_BAR_IS_HIGH    1
+
+#define BARCODE_SAMPLE_US      500    // ADC sample period: 2 kHz (>= 1 kHz)
+#define BARCODE_MIN_CONTRAST   250    // ADC counts (~0.2 V) black above white
+#define BARCODE_HYST_PCT       10     // hysteresis either side of the midpoint
 
 #define BARCODE_GLITCH_US      2000   // pulses shorter than this are noise
 #define BARCODE_END_GAP_MS     400    // no edge for this long = pass finished
@@ -43,6 +53,8 @@ typedef struct
     const char *  error;                             // why it failed
 } barcode_result_t;
 
+// Starts the ADC sampling. The sensor should be over white floor at this
+// moment, so it can learn the floor level.
 void        barcode_init(void);
 
 // Call often from the main loop. Returns true when a pass has finished
@@ -50,5 +62,9 @@ void        barcode_init(void);
 bool        barcode_poll(barcode_result_t *result);
 
 const char *barcode_cmd_name(barcode_cmd_t cmd);
+
+// Latest AO reading and the learned floor (white) and bar (black) levels,
+// in ADC counts (0..4095), for tuning and the serial printout.
+void        barcode_get_levels(uint16_t *raw, uint16_t *white, uint16_t *black);
 
 #endif // BARCODE_H

@@ -1,14 +1,19 @@
 /*
  * barcode.c
- * Reads Code 39 barcodes with an MH-sensor.
+ * Reads Code 39 barcodes with an MH-sensor's ANALOG output (AO).
  *
- * A both-edge GPIO interrupt timestamps every DO change (black <-> white).
- * The main loop turns the timestamps into widths: bar, gap, bar, ... and,
- * once no edge has arrived for BARCODE_END_GAP_MS, decodes the pass.
+ * A 2 kHz repeating timer reads the ADC (GP27). The reading is compared with
+ * two thresholds (hysteresis) set between the learned floor (white) level and
+ * the learned bar (black) level, so every black <-> white change becomes a
+ * timestamped edge. The main loop turns the edges into widths: bar, gap,
+ * bar, ... and, once no edge has arrived for BARCODE_END_GAP_MS, decodes.
  *
  * Code 39: every character is 9 elements (5 bars, 4 gaps), 3 of them thick,
- * with a thin white gap between characters. The 3 widest of each 9 are
- * marked thick, so the result does not depend on how fast the car moves.
+ * with a thin white gap between characters. Normally 2 of the 5 bars and 1 of
+ * the 4 gaps are thick, so bars and gaps are sorted separately. That keeps
+ * the read correct even if the analog thresholds make bars look slightly
+ * wider than gaps. Thick/thin is decided by comparing widths, so the result
+ * does not depend on how fast the car moves.
  */
 
 #include "barcode.h"
@@ -16,13 +21,14 @@
 #include <stdio.h>
 #include <string.h>
 #include "pico/stdlib.h"
-#include "hardware/gpio.h"
-#include "hardware/irq.h"
+#include "hardware/adc.h"
 
 #define QUEUE_SIZE        64
 #define CHAR_ELEMENTS     9
 #define THICK_PER_CHAR    3
 #define MIN_RATIO_X10     15      // thick must be >= 1.5 x thin
+#define ADC_MAX           4095
+#define WHITE_LEARN_SAMPLES 64    // floor readings averaged at start-up
 
 // ---------------------------------------------------------------------------
 // Code 39 table: 9 elements, first element = left-most bit, 1 = thick
@@ -49,12 +55,20 @@ static const code39_t code39[] =
 #define CODE39_COUNT  (sizeof(code39) / sizeof(code39[0]))
 
 // ---------------------------------------------------------------------------
-// Interrupt -> main loop queue
+// Sampler (timer interrupt) -> main loop queue
 // ---------------------------------------------------------------------------
 static volatile uint32_t edge_time_us[QUEUE_SIZE];
-static volatile uint8_t  edge_level[QUEUE_SIZE];
+static volatile uint8_t  edge_level[QUEUE_SIZE];   // 1 = now black, 0 = now white
 static volatile uint32_t head = 0;
 static volatile uint32_t tail = 0;
+
+// Analog levels in ADC counts x256 (fixed point, so slow averages still move)
+static volatile uint32_t white_q = 0;      // floor level
+static volatile uint32_t black_q = 0;      // bar level (peak, slowly decays)
+static volatile uint16_t raw_now = 0;      // latest reading
+static volatile bool     is_black = false;
+
+static struct repeating_timer sample_timer;
 
 // Pass in progress (main loop only)
 static uint32_t widths[BARCODE_MAX_ELEMENTS];
@@ -65,53 +79,82 @@ static uint32_t last_edge_us = 0;
 static int      glitches = 0;
 static bool     too_long = false;
 
-// Runs in interrupt context: store the time and the new level only.
-static void barcode_edge_isr(void)
+static uint16_t read_ao(void)
 {
-    uint32_t events = gpio_get_irq_event_mask(BARCODE_PIN)
-                      & (GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL);
-    if (events == 0) {
-        return;
-    }
-    gpio_acknowledge_irq(BARCODE_PIN, events);
+    adc_select_input(BARCODE_ADC_INPUT);
+    uint16_t v = (uint16_t)adc_read();
+    // Work with "higher = blacker" no matter how the module is wired.
+    return BARCODE_BAR_IS_HIGH ? v : (uint16_t)(ADC_MAX - v);
+}
 
-    if (events == (GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL)) {
-        return;                         // both edges at once: tiny glitch
-    }
-
+static void push_edge(uint32_t t, uint8_t black)
+{
     uint32_t next = (head + 1) % QUEUE_SIZE;
     if (next == tail) {
-        return;                         // queue full: drop the edge
+        return;                             // queue full: drop the edge
     }
-    edge_time_us[head] = time_us_32();
-    edge_level[head]   = (events & GPIO_IRQ_EDGE_RISE) ? 1 : 0;
+    edge_time_us[head] = t;
+    edge_level[head]   = black;
     head = next;
 }
 
-static bool level_is_black(int level)
+// Runs every BARCODE_SAMPLE_US in timer-interrupt context.
+static bool barcode_sample_cb(struct repeating_timer *rt)
 {
-    return BARCODE_BAR_IS_HIGH ? (level != 0) : (level == 0);
+    (void)rt;
+    uint32_t t = time_us_32();
+    uint16_t v = read_ao();
+    raw_now = v;
+
+    uint32_t white = white_q >> 8;
+
+    // Bar level: jump up to any higher reading, then decay slowly (~8 s)
+    // back toward the floor, so it follows the paper and the lighting.
+    if (((uint32_t)v << 8) > black_q) {
+        black_q = (uint32_t)v << 8;
+    } else if (black_q > white_q) {
+        black_q -= (black_q - white_q) >> 14;
+    }
+
+    uint32_t black = black_q >> 8;
+    uint32_t span  = (black > white) ? (black - white) : 0;
+    if (span < BARCODE_MIN_CONTRAST) {
+        span = BARCODE_MIN_CONTRAST;        // ignore small noise on plain floor
+    }
+
+    uint32_t mid  = white + span / 2;
+    uint32_t hyst = (span * BARCODE_HYST_PCT) / 100;
+
+    if (!is_black && v > mid + hyst) {
+        is_black = true;
+        push_edge(t, 1);                    // white -> black
+    } else if (is_black && v < mid - hyst) {
+        is_black = false;
+        push_edge(t, 0);                    // black -> white
+    }
+
+    // Floor level: slow average (~250 ms) of readings while over white.
+    if (!is_black) {
+        white_q += (int32_t)(((int32_t)v << 8) - (int32_t)white_q) >> 9;
+    }
+    return true;                            // keep the timer running
 }
 
 // ---------------------------------------------------------------------------
 // Decoding
 // ---------------------------------------------------------------------------
 
-// Marks the 3 widest of 9 elements thick and returns the Code 39 character,
-// or 0 if the pattern is not valid.
-static char decode_char(const uint32_t *w, bool *thick)
+// Marks the 'count' widest of the elements at w[first], w[first+step], ...
+// as thick. Returns false if thick and thin are not clearly different.
+static bool mark_widest(const uint32_t *w, int first, int step, int n,
+                        int count, bool *thick)
 {
-    uint16_t pattern = 0;
     uint32_t thinnest_thick = UINT32_MAX;
     uint32_t widest_thin = 0;
 
-    for (int i = 0; i < CHAR_ELEMENTS; i++) {
-        thick[i] = false;
-    }
-
-    for (int k = 0; k < THICK_PER_CHAR; k++) {
+    for (int k = 0; k < count; k++) {
         int best = -1;
-        for (int i = 0; i < CHAR_ELEMENTS; i++) {
+        for (int i = first; i < first + n * step; i += step) {
             if (!thick[i] && (best < 0 || w[i] > w[best])) {
                 best = i;
             }
@@ -119,9 +162,8 @@ static char decode_char(const uint32_t *w, bool *thick)
         thick[best] = true;
     }
 
-    for (int i = 0; i < CHAR_ELEMENTS; i++) {
+    for (int i = first; i < first + n * step; i += step) {
         if (thick[i]) {
-            pattern |= (uint16_t)(1u << (CHAR_ELEMENTS - 1 - i));
             if (w[i] < thinnest_thick) thinnest_thick = w[i];
         } else if (w[i] > widest_thin) {
             widest_thin = w[i];
@@ -129,14 +171,45 @@ static char decode_char(const uint32_t *w, bool *thick)
     }
 
     // Thick and thin must be clearly different, or the read is unreliable.
-    if ((uint64_t)thinnest_thick * 10 < (uint64_t)widest_thin * MIN_RATIO_X10) {
-        return 0;
-    }
+    return (uint64_t)thinnest_thick * 10 >= (uint64_t)widest_thin * MIN_RATIO_X10;
+}
 
+static char lookup(const bool *thick)
+{
+    uint16_t pattern = 0;
+
+    for (int i = 0; i < CHAR_ELEMENTS; i++) {
+        if (thick[i]) {
+            pattern |= (uint16_t)(1u << (CHAR_ELEMENTS - 1 - i));
+        }
+    }
     for (unsigned i = 0; i < CODE39_COUNT; i++) {
         if (code39[i].pattern == pattern) {
             return code39[i].symbol;
         }
+    }
+    return 0;
+}
+
+// Decodes one 9-element character and fills thick[0..8].
+// 1st try: 2 thick of the 5 bars + 1 thick of the 4 gaps (most characters).
+// 2nd try: 3 thick of all 9 (needed for $ / + %, which have 3 thick gaps).
+static char decode_char(const uint32_t *w, bool *thick)
+{
+    char c;
+
+    for (int i = 0; i < CHAR_ELEMENTS; i++) thick[i] = false;
+    if (mark_widest(w, 0, 2, 5, 2, thick) &&        // bars: 0,2,4,6,8
+        mark_widest(w, 1, 2, 4, 1, thick)) {        // gaps: 1,3,5,7
+        c = lookup(thick);
+        if (c != 0) {
+            return c;
+        }
+    }
+
+    for (int i = 0; i < CHAR_ELEMENTS; i++) thick[i] = false;
+    if (mark_widest(w, 0, 1, CHAR_ELEMENTS, THICK_PER_CHAR, thick)) {
+        return lookup(thick);
     }
     return 0;
 }
@@ -246,23 +319,29 @@ static void finish_pass(barcode_result_t *r)
 
 void barcode_init(void)
 {
-    gpio_init(BARCODE_PIN);
-    gpio_set_dir(BARCODE_PIN, GPIO_IN);
-    gpio_disable_pulls(BARCODE_PIN);    // the MH-sensor board drives DO
+    adc_init();
+    adc_gpio_init(BARCODE_AO_PIN);          // GP27 as an analog input
 
-    // Raw handler: does not take over the shared GPIO callback, so it can
-    // live alongside the encoder / ultrasonic interrupts later.
-    gpio_add_raw_irq_handler(BARCODE_PIN, barcode_edge_isr);
-    gpio_set_irq_enabled(BARCODE_PIN,
-                         GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
-    irq_set_enabled(IO_IRQ_BANK0, true);
+    // Learn the floor level: the sensor should be over white right now.
+    uint32_t sum = 0;
+    for (int i = 0; i < WHITE_LEARN_SAMPLES; i++) {
+        sum += read_ao();
+        sleep_us(BARCODE_SAMPLE_US);
+    }
+    white_q  = (sum / WHITE_LEARN_SAMPLES) << 8;
+    black_q  = white_q + ((uint32_t)BARCODE_MIN_CONTRAST << 8);
+    is_black = false;
+
+    // Negative period = fixed start-to-start spacing (2 kHz).
+    add_repeating_timer_us(-BARCODE_SAMPLE_US, barcode_sample_cb, NULL,
+                           &sample_timer);
 }
 
 bool barcode_poll(barcode_result_t *result)
 {
     while (tail != head) {
         uint32_t t     = edge_time_us[tail];
-        bool     black = level_is_black(edge_level[tail]);
+        bool     black = (edge_level[tail] != 0);
         tail = (tail + 1) % QUEUE_SIZE;
 
         if (!in_pass) {
@@ -319,4 +398,11 @@ const char *barcode_cmd_name(barcode_cmd_t cmd)
         case BARCODE_CMD_RIGHT: return "TURN RIGHT";
         default:                return "no command for this code";
     }
+}
+
+void barcode_get_levels(uint16_t *raw, uint16_t *white, uint16_t *black)
+{
+    *raw   = raw_now;
+    *white = (uint16_t)(white_q >> 8);
+    *black = (uint16_t)(black_q >> 8);
 }

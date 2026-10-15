@@ -8,6 +8,9 @@
 #include <stdio.h>
 #include "ir-line-sensor.h"
 #include "pico/stdlib.h"
+
+#define STEER_SMALL   50    // % turn for a small drift
+#define STEER_HARD    100   // % turn when the line is only under the left sensor
  
 static void ir_pin_init(uint pin)
 {
@@ -46,6 +49,45 @@ bool ir_line_is_right_on_line(void)
 {
     return level_is_line(ir_line_right_raw());
 }
+
+ir_line_position_t ir_line_get_position(void)
+{
+    bool left  = ir_line_is_left_on_line();
+    bool right = ir_line_is_right_on_line();
+
+    if (left && right) {
+        return IR_POS_CROSSING;
+    }
+    if (left) {
+        return IR_POS_DRIFT_RIGHT;
+    }
+    if (right) {
+        return IR_POS_DRIFT_LEFT;
+    }
+    return IR_POS_CENTERED;
+}
+
+const char *ir_line_position_name(ir_line_position_t pos)
+{
+    switch (pos) {
+        case IR_POS_DRIFT_RIGHT: return "drifted RIGHT -> steer left";
+        case IR_POS_DRIFT_LEFT:  return "drifted LEFT -> steer right";
+        case IR_POS_CROSSING:    return "both on line (crossing / junction) -> hold";
+        default:                 return "line between sensors (centred) or no line";
+    }
+}
+
+int ir_line_steering(ir_line_position_t pos)
+{
+    switch (pos) {
+        case IR_POS_DRIFT_RIGHT: last_steering = STEER_CORRECT;  break;
+        case IR_POS_DRIFT_LEFT:  last_steering = -STEER_CORRECT; break;
+        case IR_POS_CROSSING:    break;                 // hold last value
+        default:                 last_steering = 0;     break;
+    }
+    return last_steering;
+}
+
 
 // static void ir_init(uint pin)
 // {
